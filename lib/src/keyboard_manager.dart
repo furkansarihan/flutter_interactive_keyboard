@@ -1,22 +1,33 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_interactive_keyboard/src/channel_receiver.dart';
+import 'package:flutter_keyboard_visibility/flutter_keyboard_visibility.dart';
 import 'channel_manager.dart';
 
 class KeyboardManagerWidget extends StatefulWidget {
   /// The widget behind the view where the drag to close is enabled
   final Widget child;
+  final Widget footer;
+  final ScrollController scrollController;
+  final FocusNode focusNode;
 
-  final Function? onKeyboardOpen;
-  final Function? onKeyboardClose;
+  /// Optional variables for keyboard animation
+  final double? defaultKeyboardSize;
+  final Duration? duration;
+  final Curve? curve;
 
   KeyboardManagerWidget({
     Key? key,
     required this.child,
-    this.onKeyboardOpen,
-    this.onKeyboardClose,
+    required this.footer,
+    required this.scrollController,
+    required this.focusNode,
+    this.defaultKeyboardSize,
+    this.duration,
+    this.curve,
   }) : super(key: key);
 
   KeyboardManagerWidgetState createState() => KeyboardManagerWidgetState();
@@ -24,171 +35,300 @@ class KeyboardManagerWidget extends StatefulWidget {
 
 class KeyboardManagerWidgetState extends State<KeyboardManagerWidget> {
   /// Only initialised on IOS
-  late ChannelReceiver _channelReceiver;
+  static ChannelReceiver channelReceiver = ChannelReceiver();
+  static ChannelManager channelManager = ChannelManager();
 
-  List<int> _pointers = [];
-  int? get activePointer => _pointers.length > 0 ? _pointers.first : null;
+  final List<int> pointers = [];
+  int? get activePointer => pointers.length > 0 ? pointers.first : null;
 
-  List<double> _velocities = [];
-  double _velocity = 0.0;
-  int _lastTime = 0;
-  double _lastPosition = 0.0;
+  final List<double> velocities = [];
+  final List<PointerMoveEvent> pointerEvents = [];
+  double velocity = 0.0;
+  int lastTime = 0;
+  double lastPosition = 0.0;
 
-  bool _keyboardOpen = false;
+  final ValueNotifier<bool> keyboardOpen = ValueNotifier(false);
+  bool keyboardHeightFound = false;
 
-  double _keyboardHeight = 0.0;
-  double _over = 0.0;
+  double keyboardHeight = 0.0;
+  double over = 0.0;
+  double startScrollOffset = 0;
 
   bool dismissed = true;
-  bool _dismissing = false;
+  bool dismissing = false;
 
-  bool _hasScreenshot = false;
+  bool hasScreenshot = false;
+  bool moving = false;
+  bool keyboardMoving = false;
+
+  late StreamSubscription<bool> keyboardSub;
+  final ValueNotifier<KeyboardPaddingValue> bottomPadding = ValueNotifier(
+    KeyboardPaddingValue(0, 0),
+  );
 
   @override
   void initState() {
     super.initState();
     if (Platform.isIOS) {
-      _channelReceiver = ChannelReceiver(() {
-        _hasScreenshot = true;
-      });
-      _channelReceiver.init();
-      ChannelManager.init();
+      channelReceiver.init();
+      channelManager.init();
+      channelReceiver.addListener(screenshotListener);
     }
+
+    keyboardSub =
+        KeyboardVisibilityController().onChange.listen(keyboardListener);
+    widget.focusNode.addListener(focusListener);
+  }
+
+  @override
+  void dispose() {
+    if (Platform.isIOS) {
+      channelReceiver.removeListener(screenshotListener);
+    }
+    keyboardSub.cancel();
+    widget.focusNode.removeListener(focusListener);
+    super.dispose();
+  }
+
+  void screenshotListener() {
+    hasScreenshot = true;
+  }
+
+  void keyboardListener(bool visible) async {
+    keyboardOpen.value = visible;
+    if (visible && !widget.focusNode.hasFocus) return;
+    if (moving) return;
+    if (!visible && Platform.isIOS) return;
+    if (visible && keyboardHeightFound) {
+      setKeyboardPaddingValue(keyboardHeight);
+      return;
+    }
+    if (!visible && !Platform.isIOS) {
+      setKeyboardPaddingValue(0);
+      return;
+    }
+    // TODO: better animation
+    List<double> bottomList = [];
+    if (!Platform.isIOS) {}
+    while (true) {
+      final bottom = MediaQuery.of(context).viewInsets.bottom;
+      bottomList.add(bottom);
+      if (bottom != 0) {
+        setKeyboardPaddingValue(bottom);
+      }
+      final size = 50;
+      if (bottomList.length > size) {
+        final lastChunk = bottomList.sublist(
+          bottomList.length - size,
+          bottomList.length,
+        );
+        if (lastChunk.toSet().toList().length == 1) {
+          keyboardHeightFound = true;
+          // log('keyboardListener: end keyboard move');
+          break;
+        }
+      }
+      await Future.delayed(const Duration(milliseconds: 1));
+    }
+  }
+
+  void focusListener() {
+    if (!widget.focusNode.hasFocus) {
+      setKeyboardPaddingValue(0);
+    }
+  }
+
+  void setKeyboardPaddingValue(double newValue) {
+    if (newValue == 0 && !Platform.isIOS) {
+      FocusScope.of(context).requestFocus(FocusNode());
+    }
+    bottomPadding.value = KeyboardPaddingValue(
+      newValue,
+      bottomPadding.value.padding,
+    );
+  }
+
+  bool isFlicked() {
+    if (pointerEvents.isEmpty) return false;
+    final lastUpdates = pointerEvents.take(3).toList();
+    for (var element in lastUpdates) {
+      if (element.delta.dy.abs() > 5) return true;
+    }
+    return false;
   }
 
   @override
   Widget build(BuildContext context) {
     var bottom = MediaQuery.of(context).viewInsets.bottom;
-    var keyboardOpen = bottom > 0;
-    var oldKeyboardOpen = _keyboardOpen;
-    _keyboardOpen = keyboardOpen;
+    if (bottom > keyboardHeight) keyboardHeight = bottom;
 
-    if (_keyboardOpen) {
+    if (keyboardOpen.value) {
       dismissed = false;
-      _keyboardHeight = bottom;
-      if (!oldKeyboardOpen && activePointer == null) {
-        widget.onKeyboardOpen?.call();
-      }
-    } else {
-      // Close notification if the keyobard closes while not dragging
-      if (oldKeyboardOpen && activePointer == null) {
-        widget.onKeyboardClose?.call();
-        dismissed = true;
-      }
     }
 
     return Listener(
       onPointerDown: (details) {
-        //print("pointerDown $dismissed $_isAnimating $activePointer $_keyboardOpen ${_pointers.length} $_dismissing");
-        if ((!dismissed && !_dismissing) || _keyboardOpen) {
-          _pointers.add(details.pointer);
-          if (_pointers.length == 1) {
+        moving = true;
+        var position = details.position.dy;
+        over = position - (MediaQuery.of(context).size.height - keyboardHeight);
+        startScrollOffset = widget.scrollController.offset - over;
+        // log("pointerDown $dismissed $activePointer ${keyboardOpen.value} ${pointers.length} $dismissing");
+        if ((!dismissed && !dismissing) || keyboardOpen.value) {
+          pointers.add(details.pointer);
+          if (pointers.length == 1) {
             if (Platform.isIOS) {
-              ChannelManager.startScroll(
-                  MediaQuery.of(context).viewInsets.bottom);
+              channelManager
+                  .startScroll(MediaQuery.of(context).viewInsets.bottom);
             }
-            _lastPosition = details.position.dy;
-            _lastTime = DateTime.now().millisecondsSinceEpoch;
-            _velocities.clear();
+            lastPosition = details.position.dy;
+            lastTime = DateTime.now().millisecondsSinceEpoch;
+            velocities.clear();
           }
         }
       },
       onPointerUp: (details) {
-        if (details.pointer == activePointer && _pointers.length == 1) {
-          //print("pointerUp $_velocity, $_over, ${details.pointer}, $activePointer");
-          if (_over > 0) {
-            if (Platform.isIOS) {
-              if (_velocity > 0.1 || _velocity < -0.3) {
-                if (_velocity > 0) {
-                  _dismissing = true;
-                }
-                ChannelManager.fling(_velocity).then((value) {
-                  if (_velocity < 0) {
-                    if (activePointer == null && !dismissed) {
-                      showKeyboard(false);
-                    }
-                  } else {
-                    _dismissing = false;
-                    dismissed = true;
-                    widget.onKeyboardClose?.call();
-                  }
-                });
-              } else {
-                ChannelManager.expand().then((value) {
-                  if (activePointer == null) {
-                    showKeyboard(false);
-                  }
-                });
-              }
-            }
-          }
-
-          if (!Platform.isIOS) {
-            if (!_keyboardOpen) {
-              dismissed = true;
-              widget.onKeyboardClose?.call();
-            }
-          }
+        moving = false;
+        keyboardMoving = false;
+        // log("pointerUp $velocity, $over, ${details.pointer}, $activePointer");
+        if (details.pointer != activePointer || pointers.length != 1) {
+          pointers.remove(details.pointer);
+          return;
         }
-        _pointers.remove(details.pointer);
+        if (!widget.focusNode.hasFocus) {
+          // log('onPointerUp: ${widget.focusNode.hasFocus}');
+          pointers.remove(details.pointer);
+          return;
+        }
+        if (Platform.isIOS && over > 0) {
+          if (isFlicked() && velocity > 0) {
+            channelManager.fling(velocity);
+            setKeyboardPaddingValue(0);
+            dismissed = true;
+          } else {
+            setKeyboardPaddingValue(keyboardHeight);
+            channelManager.expand();
+            widget.focusNode.requestFocus();
+            Future.delayed(
+                const Duration(milliseconds: 100), () => showKeyboard(false));
+          }
+        } else {
+          setKeyboardPaddingValue(keyboardHeight);
+          if (Platform.isIOS) {
+            channelManager.expand();
+          }
+          widget.focusNode.requestFocus();
+          Future.delayed(
+              const Duration(milliseconds: 100), () => showKeyboard(false));
+        }
+        pointers.remove(details.pointer);
       },
       onPointerMove: (details) {
-        if (details.pointer == activePointer) {
+        pointerEvents.insert(0, details);
+        moving = true;
+        // log("pointerMove $over, $activePointer, ${details.pointer}");
+        if (details.pointer == activePointer && widget.focusNode.hasFocus) {
           var position = details.position.dy;
-          _over =
-              position - (MediaQuery.of(context).size.height - _keyboardHeight);
+          over =
+              position - (MediaQuery.of(context).size.height - keyboardHeight);
           updateVelocity(position);
-          //print("pointerMove $_over, $_isAnimating, $activePointer, ${details.pointer}");
-          if (_over > 0) {
+          // log("pointerMove $over, $activePointer, ${details.pointer}");
+          if (over > 0) {
+            keyboardMoving = true;
+            setKeyboardPaddingValue(keyboardHeight - over);
+          } else {
+            setKeyboardPaddingValue(keyboardHeight);
+          }
+          if (over > 0) {
+            widget.scrollController.jumpTo(widget.scrollController.offset);
             if (Platform.isIOS) {
-              if (_keyboardOpen && _hasScreenshot) hideKeyboard(false);
-              ChannelManager.updateScroll(_over);
+              if (keyboardOpen.value && hasScreenshot) hideKeyboard(false);
+              channelManager.updateScroll(over);
             } else {
-              if (_velocity > 0.1) {
-                if (_keyboardOpen) {
+              if (velocity > 0.1) {
+                if (keyboardOpen.value) {
                   hideKeyboard(true);
                 }
-              } else if (_velocity < -0.5) {
-                if (!_keyboardOpen) {
+              } else if (velocity < -0.5) {
+                if (!keyboardOpen.value) {
                   showKeyboard(true);
-                  widget.onKeyboardClose?.call();
                 }
               }
             }
           } else {
+            if (keyboardMoving) {
+              final offset = startScrollOffset + over;
+              // log('keyboardMoving: startSrollOffset: $startScrollOffset offset: $offset');
+              if (offset > 0) {
+                widget.scrollController.jumpTo(offset);
+              }
+            }
             if (Platform.isIOS) {
-              ChannelManager.updateScroll(0.0);
-              if (!_keyboardOpen) {
-                showKeyboard(false);
+              channelManager.updateScroll(over);
+              if (!keyboardOpen.value) {
+                channelManager.expand();
               }
             } else {
-              if (!_keyboardOpen) {
-                showKeyboard(true);
-                widget.onKeyboardOpen?.call();
+              if (!keyboardOpen.value) {
+                showKeyboard(false);
               }
             }
           }
         }
       },
       onPointerCancel: (details) {
-        _pointers.remove(details.pointer);
+        moving = false;
+        keyboardMoving = false;
+        pointers.remove(details.pointer);
       },
-      child: widget.child,
+      child: Column(
+        children: [
+          Expanded(child: widget.child),
+          widget.footer,
+          ValueListenableBuilder<KeyboardPaddingValue>(
+            valueListenable: bottomPadding,
+            builder: (context, value, child) {
+              final keyboardSize = keyboardHeightFound
+                  ? keyboardHeight
+                  : widget.defaultKeyboardSize ?? 300;
+              final durationMilli = widget.duration?.inMilliseconds ??
+                  (Platform.isIOS ? 500 : 250);
+              final curve = widget.curve ??
+                  (Platform.isIOS
+                      ? Cubic(.29, .73, .13, 1)
+                      : Curves.easeOutCubic);
+              Duration duration;
+              double distance = (value.prevPadding - value.padding).abs();
+              if (distance > 0) {
+                final milli = distance * durationMilli / keyboardSize;
+                duration = Duration(milliseconds: milli.ceil());
+              } else {
+                duration = const Duration();
+              }
+              // log('ValueListenableBuilder: padding: ${value.padding}, prevPadding: ${value.prevPadding}, distance: $distance, duration: ${duration.inMilliseconds}');
+              return AnimatedContainer(
+                duration: duration,
+                curve: curve,
+                height: value.padding,
+              );
+            },
+          ),
+        ],
+      ),
     );
   }
 
   updateVelocity(double position) {
     var time = DateTime.now().millisecondsSinceEpoch;
-    if (time - _lastTime > 0) {
-      _velocity = (position - _lastPosition) / (time - _lastTime);
+    if (time - lastTime > 0) {
+      velocity = (position - lastPosition) / (time - lastTime);
     }
-    _lastPosition = position;
-    _lastTime = time;
+    lastPosition = position;
+    lastTime = time;
   }
 
   showKeyboard(bool animate) {
     if (!animate && Platform.isIOS) {
-      ChannelManager.showKeyboard(true);
+      channelManager.showKeyboard(true);
     } else {
       _showKeyboard();
     }
@@ -200,7 +340,7 @@ class KeyboardManagerWidgetState extends State<KeyboardManagerWidget> {
 
   hideKeyboard(bool animate) {
     if (!animate && Platform.isIOS) {
-      ChannelManager.showKeyboard(false);
+      channelManager.showKeyboard(false);
     } else {
       _hideKeyboard();
     }
@@ -212,11 +352,17 @@ class KeyboardManagerWidgetState extends State<KeyboardManagerWidget> {
   }
 
   Future<void> removeImageKeyboard() async {
-    ChannelManager.updateScroll(_keyboardHeight);
+    channelManager.updateScroll(keyboardHeight);
   }
 
   Future<void> safeHideKeyboard() async {
     await removeImageKeyboard();
     _hideKeyboard();
   }
+}
+
+class KeyboardPaddingValue {
+  const KeyboardPaddingValue(this.padding, this.prevPadding);
+  final double padding;
+  final double prevPadding;
 }

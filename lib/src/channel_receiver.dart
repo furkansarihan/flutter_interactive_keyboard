@@ -1,17 +1,17 @@
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-class ChannelReceiver {
-  final Function onScreenshotTaken;
+class ChannelReceiver extends ChangeNotifier {
+  MethodChannel _channel = const MethodChannel('flutter_interactive_keyboard');
 
-  MethodChannel channel = const MethodChannel('flutter_interactive_keyboard');
-
-  ChannelReceiver(this.onScreenshotTaken);
-
+  bool _initialized = false;
   init() {
-    channel.setMethodCallHandler((MethodCall call) async {
+    if (_initialized) return;
+    _initialized = true;
+    _channel.setMethodCallHandler((MethodCall call) async {
       switch (call.method) {
         case 'screenshotTaken':
-          onScreenshotTaken();
+          this.notifyListeners();
           break;
       }
     });
